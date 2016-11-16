@@ -1,16 +1,24 @@
 import sys, traceback
 from datetime import datetime
 
+import gtk
 from path_helpers import path
-from flatland import Form, Float, Integer, Boolean, String
+from pygtkhelpers.utils import dict_to_form
+from flatland import Form, Float, Integer, Boolean, String, Enum
 from flatland.validation import ValueAtLeast, ValueAtMost
+import microdrop_utility as utility
+from microdrop_utility.gui import yesno, FormViewDialog
+from microdrop.gui.protocol_grid_controller import ProtocolGridController
 from microdrop.logger import logger
 from microdrop.plugin_helpers import (AppDataController, StepOptionsController,
                                       get_plugin_info)
 from microdrop.plugin_manager import (PluginGlobals, Plugin, IPlugin,
-                                      implements, emit_signal)
+                                      implements, emit_signal,
+                                      get_service_instance)
 from microdrop.app_context import get_app
 import gobject
+from serial_device import get_serial_ports
+from stepper_motor_controller import SerialProxy, get_firmwares
 
 PluginGlobals.push_env('microdrop.managed')
 
@@ -22,6 +30,12 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
     implements(IPlugin)
     version = get_plugin_info(path(__file__).parent).version
     plugin_name = get_plugin_info(path(__file__).parent).plugin_name
+
+    serial_ports_ = [port for port in get_serial_ports()]
+    if len(serial_ports_):
+        default_port_ = serial_ports_[0]
+    else:
+        default_port_ = None
 
     '''
     AppFields
@@ -39,9 +53,9 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
             config file, in a section named after this plugin's name attribute
     '''
     AppFields = Form.of(
-        Float.named('steps_per_microliter').using(optional=True, default=1.0),
-        #Boolean.named('bool_field').using(optional=True, default=False),
-        #String.named('string_field').using(optional=True, default=''),
+       Enum.named('serial_port').using(default=default_port_,
+                                        optional=True).valued(*serial_ports_),
+       Float.named('steps_per_microliter').using(optional=True, default=1.0),
     )
 
     '''
@@ -59,26 +73,159 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
         -the values of these fields will be stored persistently for each step
     '''
     StepFields = Form.of(
-        Float.named('microliters_per_min').using(optional=True, default=100,
-                                        validators=
-                                        [ValueAtLeast(minimum=0),
-                                         ValueAtMost(maximum=100000)]),
+        Float.named('microliters_per_min').using(optional=True, default=60,
+                                                 #validators=
+                                                 #[ValueAtLeast(minimum=0),
+                                                 # ValueAtMost(maximum=100000)]
+                                                 ),
         Float.named('microliters').using(optional=True, default=10,
-                                            #validators=
-                                            #[ValueAtLeast(minimum=0),
-                                            # ValueAtMost(maximum=100000)]
-                                           ),
-        #Boolean.named('bool_field').using(optional=True, default=False),
-        #String.named('string_field').using(optional=True, default=''),
+                                         #validators=
+                                         #[ValueAtLeast(minimum=0),
+                                         # ValueAtMost(maximum=100000)]
+                                         ),
     )
 
     def __init__(self):
         self.name = self.plugin_name
-        self.timeout_id = None
-        self.start_time = None
+        self.proxy = None
+        self.initialized = False  # Latch to, e.g., config menus, only once
+        
+    def connect(self):
+        """ 
+        Try to connect to the syring pump at the default serial
+        port selected in the Microdrop application options.
+
+        If unsuccessful, try to connect to the proxy on any
+        available serial port, one-by-one.
+        """
+        if len(SyringePumpPlugin.serial_ports_):
+            app_values = self.get_app_values()
+            # try to connect to the last successful port
+            try:
+                self.proxy = SerialProxy(port=str(app_values['serial_port']))
+            except:
+                logger.warning('Could not connect to the %s on port %s. '
+                               'Checking other ports...',
+                               SerialProxy.host_package_name,
+                               app_values['serial_port'], exc_info=True)
+                self.proxy = SerialProxy()
+            app_values['serial_port'] = self.proxy.port
+            self.set_app_values(app_values)
+        else:
+            raise Exception("No serial ports available.")
+
+    def check_device_name_and_version(self):
+        """
+        Check to see if:
+
+         a) The connected device is a what we are expecting
+         b) The device firmware matches the host driver API version
+
+        In the case where the device firmware version does not match, display a
+        dialog offering to flash the device with the firmware version that
+        matches the host driver API version.
+        """ 
+        try:
+            self.connect()
+            properties = self.proxy.properties
+            package_name = properties['package_name']
+            display_name = properties['display_name']
+            if package_name != self.proxy.host_package_name:
+                raise Exception("Device is not a %s" % properties['display_name'])
+
+            host_software_version = self.proxy.host_software_version
+            remote_software_version = self.proxy.remote_software_version
+
+            # Reflash the firmware if it is not the right version.
+            if host_software_version != remote_software_version:
+                response = yesno("The %s firmware version (%s) "
+                                 "does not match the driver version (%s). "
+                                 "Update firmware?" % (display_name,
+                                                       remote_software_version,
+                                                       host_software_version))
+                if response == gtk.RESPONSE_YES:
+                    self.on_flash_firmware()
+        except Exception, why:
+            logger.warning("%s" % why)
+
+    def on_edit_configuration(self, widget=None, data=None):
+        '''
+        Display a dialog to manually edit the configuration settings.
+        '''
+        config = self.proxy.config
+        form = dict_to_form(config)
+        dialog = FormViewDialog(form, 'Edit configuration settings')
+        valid, response = dialog.run()
+        if valid:
+            self.proxy.update_config(**response)
+
+    def on_flash_firmware(self, widget=None, data=None):
+        app = get_app()
+        try:
+            connected = self.proxy != None
+            if not connected:
+                self.check_device_name_and_version()
+            if connected:
+                port = self.proxy.port
+                # disconnect
+                del self.proxy
+                self.proxy = None
+
+                from arduino_helpers.upload import upload
+
+                logger.info(upload('uno', lambda b: get_firmwares()[b][0], port))
+                app.main_window_controller.info("Firmware updated successfully.",
+                                                "Firmware update")
+        except Exception, why:
+            logger.error("Problem flashing firmware. ""%s" % why)
+        self.check_device_name_and_version()
+
+    def cleanup_plugin(self):
+        if self.proxy != None:
+            del self.proxy
+            self.proxy = None
+
+    def on_plugin_enable(self):
+        super(SyringePumpPlugin, self).on_plugin_enable()
+        self.cleanup_plugin()
+        self.check_device_name_and_version()
+        if not self.initialized:
+            app = get_app()
+            self.tools_menu_item = gtk.MenuItem('Syringe pump controller' )
+            app.main_window_controller.menu_tools.append(self.tools_menu_item)
+            self.tools_menu = gtk.Menu()
+            self.tools_menu.show()
+            self.tools_menu_item.set_submenu(self.tools_menu)
+
+            self.edit_config_menu_item = \
+                gtk.MenuItem("Edit configuration settings...")
+            self.tools_menu.append(self.edit_config_menu_item)
+            self.edit_config_menu_item.connect("activate",
+                                               self.on_edit_configuration)
+            self.edit_config_menu_item.show()
+            self.edit_config_menu_item.set_sensitive(False)
+
+        self.tools_menu_item.show()
+        self.edit_config_menu_item.set_sensitive(self.proxy != None)
+
+        if get_app().protocol:
+            self.on_step_run()
+            self._update_protocol_grid()
+
+    def on_plugin_disable(self):
+        self.tools_menu_item.hide()
+        self.cleanup_plugin()
+        if get_app().protocol:
+            self.on_step_run()
+            self._update_protocol_grid()
+
+    def _update_protocol_grid(self):
+        pgc = get_service_instance(ProtocolGridController, env='microdrop')
+        if pgc.enabled_fields:
+            pgc.update_grid()
 
     def on_step_run(self):
-        """
+        """"
         Handler called whenever a step is executed. Note that this signal
         is only emitted in realtime mode or if a protocol is running.
 
@@ -96,26 +243,18 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
         logger.info('[SyringePumpPlugin] on_step_run(): step #%d',
                     app.protocol.current_step_number)
         app_values = self.get_app_values()
+        options = self.get_step_options()
+
+        if (self.proxy != None and (app.realtime_mode or app.running)):
+            steps = app_values['steps_per_microliter'] * options['microliters'] 
+            steps_per_second = (app_values['steps_per_microliter']
+                                * options['microliters_per_min'] / 60.0)
+            self.proxy.move(steps, steps_per_second)
+            print 'move(steps=%d, steps_per_second=%d)' % (steps, steps_per_second)
+            while self.proxy.steps_remaining:
+                gtk.main_iteration()
         return_value = None
         emit_signal('on_step_complete', [self.name, return_value])
-
-    def on_step_options_swapped(self, plugin, old_step_number, step_number):
-        """
-        Handler called when the step options are changed for a particular
-        plugin.  This will, for example, allow for GUI elements to be
-        updated based on step specified.
-
-        Parameters:
-            plugin : plugin instance for which the step options changed
-            step_number : step number that the options changed for
-        """
-        pass
-
-    def on_step_swapped(self, old_step_number, step_number):
-        """
-        Handler called when the current step is swapped.
-        """
-        pass
 
 
 PluginGlobals.pop_env()
