@@ -104,9 +104,8 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
             try:
                 self.proxy = SerialProxy(port=str(app_values['serial_port']))
             except:
-                logger.warning('Could not connect to the %s on port %s. '
+                logger.warning('Could not connect to the syringe pump on port %s. '
                                'Checking other ports...',
-                               SerialProxy.host_package_name,
                                app_values['serial_port'], exc_info=True)
                 self.proxy = SerialProxy()
             app_values['serial_port'] = self.proxy.port
