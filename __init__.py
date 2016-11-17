@@ -248,7 +248,8 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
         options = self.get_step_options()
 
         if (self.proxy != None and (app.realtime_mode or app.running)):
-            steps = app_values['steps_per_microliter'] * options['microliters'] 
+            steps = (app_values['steps_per_microliter'] * options['microliters']
+                     * self.proxy.microstep_setting)
             steps_per_second = (app_values['steps_per_microliter']
                                 * options['microliters_per_min'] / 60.0)
             self.proxy.move(steps, steps_per_second)
