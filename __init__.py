@@ -18,7 +18,6 @@ from microdrop.plugin_manager import (PluginGlobals, Plugin, IPlugin,
 from microdrop.app_context import get_app
 import gobject
 from serial_device import get_serial_ports
-from stepper_motor_controller import SerialProxy, get_firmwares
 
 PluginGlobals.push_env('microdrop.managed')
 
@@ -98,6 +97,9 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
         If unsuccessful, try to connect to the proxy on any
         available serial port, one-by-one.
         """
+
+        from stepper_motor_controller import SerialProxy
+
         if len(SyringePumpPlugin.serial_ports_):
             app_values = self.get_app_values()
             # try to connect to the last successful port
@@ -171,6 +173,7 @@ class SyringePumpPlugin(Plugin, AppDataController, StepOptionsController):
                 self.proxy = None
 
                 from arduino_helpers.upload import upload
+                from stepper_motor_controller import get_firmwares
 
                 logger.info(upload('uno', lambda b: get_firmwares()[b][0], port))
                 app.main_window_controller.info("Firmware updated successfully.",
