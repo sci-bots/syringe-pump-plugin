@@ -1,1 +1,1 @@
-stepper-motor-controller
+stepper-motor-controller>=0.2
